@@ -1,0 +1,14 @@
+# Các thư viện phụ thuộc cho ứng dụng cào kết quả xổ số (Deeplott Scrapers)
+# Cài đặt toàn bộ thư viện bằng lệnh: pip install -r requirements.txt
+
+# Thư viện gửi các yêu cầu HTTP (POST, GET) để lấy dữ liệu từ ketquadientoan.com
+requests>=2.28.0
+
+# Thư viện bs4 (BeautifulSoup) dùng để phân tích cú pháp HTML và trích xuất dữ liệu kết quả
+beautifulsoup4>=4.11.0
+
+# Thư viện web server Flask để tạo Web Service API
+Flask>=2.2.0
+
+# Web server Gateway (WSGI) phục vụ chạy ứng dụng môi trường Production trên Render
+gunicorn>=20.1.0
