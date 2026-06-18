@@ -12,3 +12,12 @@ Flask>=2.2.0
 
 # Web server Gateway (WSGI) phục vụ chạy ứng dụng môi trường Production trên Render
 gunicorn>=20.1.0
+
+# === Thư viện cho Lotto 535 Ensemble Prediction System ===
+
+# Xử lý dữ liệu dạng bảng và tính toán số học
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Machine learning (dùng cho các phương pháp thống kê bổ trợ)
+scikit-learn>=1.3.0
