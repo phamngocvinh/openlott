@@ -21,3 +21,9 @@ numpy>=1.24.0
 
 # Machine learning (dùng cho các phương pháp thống kê bổ trợ)
 scikit-learn>=1.3.0
+
+# === Thư viện cho Firestore Integration ===
+
+# Firebase Admin SDK: đẩy dữ liệu kết quả xổ số lên Cloud Firestore
+# Để app có thể đọc real-time thay vì fetch từ GitHub
+firebase-admin>=6.0.0
