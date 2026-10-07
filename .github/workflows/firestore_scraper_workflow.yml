@@ -1,0 +1,132 @@
+# =============================================================================
+# firestore_scraper_workflow.yml
+#
+# GitHub Actions workflow: cào kết quả xổ số và đồng bộ lên Cloud Firestore.
+# Quy trình:
+#   1) Chạy 4 script cào dữ liệu (Keno, Lotto 535, Mega 645, Power 655)
+#   2) Bootstrap base từ Firestore (vì repo không chứa file .txt)
+#   3) Push kết quả mới nhất lên Cloud Firestore
+#   4) Keep-alive: commit 1 lần/ngày để tránh GitHub tự tắt schedule sau 60 ngày
+#
+# Lịch chạy: mỗi 10 phút, chỉ trong khung giờ quay (giờ VN 06:00-22:30).
+#   VN = UTC+7
+#   - VN 06:00-06:50  <= UTC 23:00-23:50 (hôm trước) -> cron '*/10 23 * * *'
+#   - VN 07:00-21:50  <= UTC 00:00-14:50            -> cron '*/10 0-14 * * *'
+#   - VN 22:00-22:30  <= UTC 15:00-15:30            -> cron '0,10,20,30 15 * * *'
+# Kích hoạt thủ công: workflow_dispatch
+#
+# Lưu ý:
+#   - Public repo => Actions minutes không giới hạn; GitHub cho phép tối thiểu 5 phút.
+#   - Schedule là "best-effort": có thể trễ/bỏ khi GitHub tải cao.
+#   - Keep-alive dùng quyền contents: write và chỉ commit khi sang ngày mới.
+#
+# Bảo mật: chỉ dùng secret FIREBASE_SERVICE_ACCOUNT. Không nhúng secret vào repo.
+# =============================================================================
+
+name: Firestore Lottery Scraper
+
+on:
+  schedule:
+    # VN 06:00-06:50
+    - cron: '*/10 23 * * *'
+    # VN 07:00-21:50
+    - cron: '*/10 0-14 * * *'
+    # VN 22:00, 22:10, 22:20, 22:30
+    - cron: '0,10,20,30 15 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run — chạy scraper nhưng không push lên Firestore'
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: write   # cần cho bước keep-alive commit
+
+# Chống chồng lấn: nếu lần trước chưa xong thì xếp hàng, không hủy giữa chừng
+concurrency:
+  group: firestore-scraper
+  cancel-in-progress: false
+
+jobs:
+  scrape-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15  # Phòng trường hợp scraper bị treo
+    env:
+      # Ép múi giờ VN để scraper tính "hôm nay" đúng (runner mặc định là UTC)
+      TZ: Asia/Saigon
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: python/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r python/requirements.txt
+
+      - name: Setup Firebase credentials
+        # Giải mã secret thành file tạm rồi set FIREBASE_CREDENTIALS_PATH cho script.
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          if [ -z "$FIREBASE_SERVICE_ACCOUNT" ]; then
+            echo "WARNING: FIREBASE_SERVICE_ACCOUNT secret is not set. Firestore push sẽ bị skip."
+          else
+            echo "$FIREBASE_SERVICE_ACCOUNT" > /tmp/firebase-service-account-key.json
+            echo "FIREBASE_CREDENTIALS_PATH=/tmp/firebase-service-account-key.json" >> "$GITHUB_ENV"
+            echo "Firebase credentials file created."
+          fi
+
+      - name: Run scraper và push lên Firestore
+        working-directory: ./python
+        run: |
+          ARGS=""
+
+          # Input dry_run từ workflow_dispatch
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+
+          # Nếu thiếu credentials thì tự động bật dry-run để tránh ghi lỗi
+          if [ -z "$FIREBASE_CREDENTIALS_PATH" ]; then
+            echo "No Firebase credentials available, enabling --dry-run automatically."
+            ARGS="$ARGS --dry-run"
+          fi
+
+          echo "🚀 Executing: python firestore_sync_scraper.py $ARGS"
+          python firestore_sync_scraper.py $ARGS
+
+      - name: Keep-alive (chống GitHub tự tắt schedule sau 60 ngày)
+        # Vì repo không commit kết quả, ta commit 1 file mốc ngày 1 lần/ngày.
+        # Chỉ commit khi sang ngày mới để tránh spam commit mỗi 10 phút.
+        if: always()
+        run: |
+          TODAY=$(date +%Y-%m-%d)
+
+          if [ "$(cat .keepalive 2>/dev/null)" = "$TODAY" ]; then
+            echo "✅ Keep-alive đã cập nhật hôm nay ($TODAY), bỏ qua."
+            exit 0
+          fi
+
+          echo "$TODAY" > .keepalive
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          git commit -m "chore: keep-alive $TODAY [skip ci]"
+          git push
+          echo "✅ Đã commit keep-alive cho $TODAY."
+
+      - name: Thông báo khi thất bại
+        if: failure()
+        run: |
+          echo "❌ Workflow thất bại! Kiểm tra logs để biết chi tiết."
+          echo "   Thời gian: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"

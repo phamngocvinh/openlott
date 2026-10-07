@@ -1,0 +1,24 @@
+# === Secrets & credentials (KHÔNG bao giờ commit) ===
+.env
+*.env
+*adminsdk*.json
+*-firebase-adminsdk-*.json
+firebase-service-account*.json
+secrets/
+
+# === Telegram state / flags (không dùng trong repo này) ===
+telegram_alert_state.json
+freshness_alert_state.json
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+
+# === Logs & tạm ===
+*.log
+logs/
+tmp/
