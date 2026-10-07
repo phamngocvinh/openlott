@@ -1,0 +1,11 @@
+# Dependencies cho scraper Deeplott (public)
+# Cài đặt: pip install -r requirements.txt
+
+# HTTP client để lấy dữ liệu kết quả xổ số
+requests>=2.28.0
+
+# Phân tích cú pháp HTML
+beautifulsoup4>=4.11.0
+
+# Firebase Admin SDK: đẩy dữ liệu lên Cloud Firestore
+firebase-admin>=6.0.0
