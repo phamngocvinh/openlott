@@ -18,12 +18,26 @@ v1.0.6: Switched primary source to minhchinh.com (new logic: fetch_page_content_
         + parse_results_minhchinh). ketquadientoan.com kept as backup source (old functions
         preserved). Added --source CLI flag: '--source backup' forces ketquadientoan,
         '--source minhchinh' forces minhchinh; default tries minhchinh then falls back.
+v1.0.7: Fallback theo FIELD (dự phòng khi kéo thiếu data). parse_results_minhchinh giờ trả
+        về ParseOutcome (record đầy đủ + record thiếu field) thay vì âm thầm bỏ dòng/ghi 0.
+        run() chỉ gọi ketquadientoan khi phát hiện field thiếu (lazy), bù field còn thiếu cho
+        cả kỳ mới cào lẫn N dòng gần nhất của file kết quả. Key vẫn là date|time_code nên
+        vẫn hỗ trợ đúng 2 kỳ/ngày. Định dạng file giữ nguyên.
 """
 
 import requests
 from bs4 import BeautifulSoup
 import os
 import re
+import datetime
+
+from result_fallback import (
+    GameId,
+    ParseOutcome,
+    detect_missing_fields,
+    merge_missing_fields,
+)
+
 
 class Lotto535Scraper:
     """
@@ -43,6 +57,14 @@ class Lotto535Scraper:
         }
         self.target_count = 100
         self.output_file = "lotto_535_results.txt"
+
+        # --- Dự phòng theo field ---
+        # Game id dùng cho schema vá field
+        self.game = GameId.LOTTO
+        # Số dòng gần nhất của file kết quả được thử vá từ nguồn dự phòng
+        self.file_repair_scan_limit = 100
+        # Nhãn nguồn dự phòng để ghi log
+        self.backup_source_label = "ketquadientoan.com"
 
     def fetch_page_content(self):
         """
@@ -192,16 +214,23 @@ class Lotto535Scraper:
     def parse_results_minhchinh(self, html_content):
         """
         Parses minhchinh.com HTML to extract Date, DrawTime (13H/21H), Numbers and Jackpot.
+
+        Trả về ParseOutcome:
+            - records    : các kỳ đầy đủ field.
+            - incomplete : các kỳ THIẾU field (thiếu bộ số, thiếu giờ quay, hoặc thiếu/0
+                           jackpot), vẫn giữ nguyên định dạng dòng để run() thử vá từ nguồn
+                           dự phòng.
+
         Cấu trúc bảng (bảng kết quả): table.table-mini-result nằm trong #bangthongkexoso.
         - Cột 0: "dd/mm/yy HHh" (năm 2 chữ số, chữ 'h' thường) -> chuẩn hóa dd/mm/yyyy + HH (in hoa)
         - Cột 1: div.balls chứa 5 span.mini-ball.ball_lotto + 1 span.mini-ball.ball_lotto.special (wildcard)
         - Cột 2: Độc Đắc (jackpot), có dấu phẩy phân tách hàng nghìn -> bỏ dấu phẩy
         """
+        outcome = ParseOutcome()
         if not html_content:
-            return []
+            return outcome
 
         soup = BeautifulSoup(html_content, 'html.parser')
-        extracted_data = []
 
         # Định vị bảng kết quả trong #bangthongkexoso (bảng đầu tiên có class table-mini-result)
         table = None
@@ -216,20 +245,22 @@ class Lotto535Scraper:
                     break
         if not table:
             print("Critical Error: Could not find minhchinh results table (table-mini-result).")
-            return []
+            return outcome
 
         rows = table.find_all('tr')
         if not rows:
-            return []
+            return outcome
         # Hàng đầu tiên là header (<th>) -> bỏ qua
         start_index = 1 if rows[0].find('th') or 'ngày' in rows[0].get_text().lower() else 0
 
+        processed = 0
         for row in rows[start_index:]:
-            if len(extracted_data) >= self.target_count:
+            if processed >= self.target_count:
                 break
 
             cols = row.find_all('td')
-            if len(cols) < 3:
+            # Cần tối thiểu Ngày + Kết quả; jackpot có thể thiếu (sẽ đánh dấu để vá).
+            if len(cols) < 2:
                 continue
 
             # Cột 0: Ngày mở thưởng + kỳ quay, ví dụ "27/08/26 21h"
@@ -261,10 +292,6 @@ class Lotto535Scraper:
                 # Fallback: phân tích trực tiếp text trong cột
                 numbers = [n.strip() for n in cols[1].get_text(" ", strip=True).split() if n.strip().isdigit()]
 
-            # Lotto 5/35 luôn có 6 số (5 số chính + wildcard); bỏ qua dòng không đủ
-            if len(numbers) != 6:
-                continue
-
             # Cột 2+: Độc Đắc (jackpot). Lotto 5/35 có 1 jackpot/1 kỳ.
             jackpots = []
             numbers_concat = ''.join(numbers)
@@ -277,11 +304,139 @@ class Lotto535Scraper:
             if not jackpots:
                 jackpots.append("0")
 
-            # Format: Date|DrawTime|Numbers|Jackpot
-            jackpot_str = "|".join(jackpots)
-            extracted_data.append(f"{draw_date}|{time_code}|{','.join(numbers)}|{jackpot_str}")
+            record = f"{draw_date}|{time_code}|{','.join(numbers)}|{'|'.join(jackpots)}"
+            processed += 1
+            # add() tự phân loại đầy đủ/thiếu và GIỮ NGUYÊN thứ tự gốc trên trang.
+            outcome.add(self.game, record)
 
-        return extracted_data
+        return outcome
+
+    def _build_backup_map(self) -> dict:
+        """
+        Tải & parse nguồn dự phòng ketquadientoan, trả về map {key: record}.
+
+        Key = date|time_code nên vẫn phân biệt đúng 2 kỳ/ngày.
+
+        Chỉ được gọi khi thực sự có field thiếu (lazy) để tránh gọi web dư thừa.
+        """
+        html = self.fetch_page_content()
+        if not html:
+            print(f"⚠️  Không tải được nguồn dự phòng {self.backup_source_label}.")
+            return {}
+        backup_map = {}
+        for record in self.parse_results(html):
+            backup_map[self.extract_key(record)] = record
+        print(f"   Nguồn dự phòng {self.backup_source_label}: {len(backup_map)} kỳ.")
+        return backup_map
+
+    def _repair_one(self, record: str, backup_map: dict) -> tuple:
+        """Vá field thiếu của 1 record từ backup_map. Trả (record_sau_vá, field_đã_vá)."""
+        missing = detect_missing_fields(self.game, record)
+        if not missing:
+            return record, []
+        backup_record = backup_map.get(self.extract_key(record))
+        if backup_record is None:
+            return record, []
+        merged, filled = merge_missing_fields(self.game, record, backup_record)
+        return merged, filled
+
+    def _count_fields(self, filled: list, field_stats: dict) -> None:
+        """Cộng dồn số lần từng field được vá (phục vụ log tổng kết)."""
+        for name in filled:
+            field_stats[name] = field_stats.get(name, 0) + 1
+
+    def _format_field_stats(self, field_stats: dict) -> str:
+        """Định dạng thống kê field đã vá cho log."""
+        if not field_stats:
+            return "không có field nào"
+        return ", ".join(f"{name}: {count}" for name, count in sorted(field_stats.items()))
+
+    def _sort_records_desc(self, records: list) -> list:
+        """Sắp xếp record mới→cũ theo (NGÀY, kỳ 21H trước 13H) cho Lotto 5/35."""
+        def _key(record: str):
+            parts = record.split('|')
+            date_str = parts[0] if len(parts) > 0 else ""
+            time_code = parts[1] if len(parts) > 1 else ""
+            try:
+                day = datetime.datetime.strptime(date_str, "%d/%m/%Y")
+            except ValueError:
+                day = datetime.datetime.min
+            return (day, time_code)
+        return sorted(records, key=_key, reverse=True)
+
+    def _repair_missing_fields(self, ordered_records: list, existing_lines: list) -> tuple:
+        """
+        Dự phòng theo field: bù các field thiếu từ nguồn dự phòng (ketquadientoan).
+
+        Giữ NGUYÊN thứ tự thời gian (mới→cũ) của `ordered_records` sau khi ghép, để bước
+        reconcile prepend đúng thứ tự (tránh kỳ cũ chen lên trên kỳ mới).
+
+        Phạm vi vá:
+            - toàn bộ record mới cào (ordered_records) — giữ đúng vị trí từng record,
+            - N dòng gần nhất của file kết quả (existing_lines[:file_repair_scan_limit]).
+
+        Chỉ tải nguồn dự phòng MỘT lần và CHỈ khi có ít nhất 1 record thiếu field.
+
+        Returns:
+            (fetched_records_sau_vá, existing_lines_sau_vá)
+        """
+        head = existing_lines[: self.file_repair_scan_limit]
+        tail = existing_lines[self.file_repair_scan_limit:]
+
+        candidates = [
+            record
+            for record in (ordered_records + head)
+            if detect_missing_fields(self.game, record)
+        ]
+        if not candidates:
+            return ordered_records, existing_lines
+
+        print(
+            f"⚠️  Phát hiện {len(candidates)} record thiếu field, "
+            f"tải nguồn dự phòng {self.backup_source_label} để vá..."
+        )
+        backup_map = self._build_backup_map()
+        if not backup_map:
+            print("⚠️  Không lấy được nguồn dự phòng; loại bỏ record thiếu field khỏi dữ liệu mới.")
+            kept = [r for r in ordered_records if not detect_missing_fields(self.game, r)]
+            return kept, existing_lines
+
+        field_stats: dict = {}
+        filled_total = 0
+        still_bad = 0
+
+        # (1) Record mới cào: vá GIỮ NGUYÊN VỊ TRÍ; chỉ giữ nếu sau khi vá đã đầy đủ.
+        repaired_fetched = []
+        for record in ordered_records:
+            merged, filled = self._repair_one(record, backup_map)
+            if filled:
+                filled_total += 1
+                self._count_fields(filled, field_stats)
+                print(f"   ↳ Vá kỳ {self.extract_key(record)} (mới cào): {', '.join(filled)}")
+            if detect_missing_fields(self.game, merged):
+                if filled:
+                    still_bad += 1
+                    print(f"⚠️  Bỏ qua kỳ thiếu field không vá được: {merged}")
+                continue
+            repaired_fetched.append(merged)
+
+        # (2) N dòng đầu file cũ: vá tại chỗ, KHÔNG xoá dữ liệu lịch sử.
+        repaired_head = []
+        for record in head:
+            merged, filled = self._repair_one(record, backup_map)
+            if filled:
+                filled_total += 1
+                self._count_fields(filled, field_stats)
+                print(f"   ↳ Vá kỳ {self.extract_key(record)} (trong file): {', '.join(filled)}")
+            if filled and detect_missing_fields(self.game, merged):
+                still_bad += 1
+            repaired_head.append(merged)
+
+        print(
+            f"   Vá dự phòng: {filled_total} record được bù field "
+            f"({self._format_field_stats(field_stats)}); {still_bad} record vẫn còn thiếu."
+        )
+        return repaired_fetched, repaired_head + tail
 
     def read_all_lines(self):
         """
@@ -334,6 +489,7 @@ class Lotto535Scraper:
 
         # Bước 2: Cào dữ liệu mới từ web (chọn nguồn theo source)
         all_fetched = []
+        fetched_order = []
         source_used = None
 
         if source == "backup":
@@ -344,14 +500,14 @@ class Lotto535Scraper:
         elif source == "minhchinh":
             html = self.fetch_page_content_minhchinh()
             if html:
-                all_fetched = self.parse_results_minhchinh(html)
+                fetched_order = self.parse_results_minhchinh(html).order
             source_used = "minhchinh"
         else:
             # Mặc định: minhchinh primary, ketquadientoan backup
             html = self.fetch_page_content_minhchinh()
             if html:
-                all_fetched = self.parse_results_minhchinh(html)
-            if all_fetched:
+                fetched_order = self.parse_results_minhchinh(html).order
+            if fetched_order:
                 source_used = "minhchinh"
             else:
                 print("minhchinh không trả về dữ liệu, fallback sang ketquadientoan (backup)...")
@@ -360,10 +516,19 @@ class Lotto535Scraper:
                     all_fetched = self.parse_results(html)
                 source_used = "ketquadientoan"
 
-        if not all_fetched:
+        if not all_fetched and not fetched_order:
             print("No data fetched from any source.")
+        print(f"Fetched {len(all_fetched) + len(fetched_order)} records from {source_used}.")
+
+        # Bước 2b: Dự phòng theo field — CHỈ tải ketquadientoan khi có field thiếu.
+        # GIỮ NGUYÊN thứ tự thời gian (mới→cũ) của nguồn chính khi ghép dự phòng.
+        # Nếu nguồn đang dùng đã là ketquadientoan thì không cần vá thêm.
+        if source_used == "minhchinh":
+            all_fetched, existing_lines = self._repair_missing_fields(fetched_order, existing_lines)
+
+        if not all_fetched and not existing_lines:
+            print("⚠️  Không có dữ liệu mới và file kết quả rỗng; dừng để tránh ghi file rỗng.")
             return
-        print(f"Fetched {len(all_fetched)} records from {source_used}.")
 
         # Bước 3: Build dict từ dữ liệu mới (key = date|time_code)
         fetched_dict = {}
@@ -406,7 +571,8 @@ class Lotto535Scraper:
         if new_records:
             merged = new_records + merged
 
-        # Bước 6: Ghi file
+        # Bước 6: Ghi file — đảm bảo thứ tự mới→cũ (tự sửa mọi lệch thứ tự còn sót).
+        merged = self._sort_records_desc(merged)
         with open(self.output_file, 'w', encoding='utf-8') as f:
             for record in merged:
                 f.write(record + '\n')

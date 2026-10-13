@@ -9,6 +9,10 @@ v1.1.0: Sửa lỗi không cào được dữ liệu sau khi minhchinh.com thi�
         (kỳ quay .kn-ky, thời gian .kn-time / .kn-date, bộ 20 số .kn-ball).
         Định dạng file đầu ra (DD/MM/YYYY,HH:MM,n1..n20) và toàn bộ luồng
         gộp / loại trùng / sắp xếp được giữ nguyên để không ảnh hưởng các thành phần phía sau.
+v1.2.0: Fallback theo KỲ (dự phòng khi kéo thiếu data). Thêm nguồn dự phòng
+        ketquadientoan.com (cấu trúc .kq-*). parse_keno_rows giờ trả về ParseOutcome để phát
+        hiện kỳ thiếu số thay vì âm thầm bỏ qua. run() chỉ tải nguồn dự phòng khi thiếu kỳ
+        hoặc không cào được kỳ mới, rồi bù các kỳ thiếu. Định dạng file giữ nguyên.
 
 Lưu ý múi giờ:
     Script dùng datetime.now() để lấy "ngày hôm nay". Trên CI (GitHub Actions),
@@ -16,10 +20,17 @@ Lưu ý múi giờ:
 """
 
 import os
+import re
 import requests
 import time
 from bs4 import BeautifulSoup
 from datetime import datetime
+
+from result_fallback import (
+    GameId,
+    ParseOutcome,
+    detect_missing_fields,
+)
 
 class KenoConstants:
     """
@@ -69,6 +80,17 @@ class KenoConstants:
 
     # Số lượng dòng kết quả tối đa được giữ lại trong file output (mới nhất được ưu tiên)
     MAX_RECORDS = 2000
+
+    # --- Nguồn dự phòng (ketquadientoan.com) ---
+    URL_BACKUP = "https://www.ketquadientoan.com/ket-qua-xo-so-dien-toan-keno.html"
+    BACKUP_SOURCE_LABEL = "ketquadientoan.com"
+    BACKUP_HTML_ITEM_CLASS = "kq-item"
+    BACKUP_HTML_KY_CLASS = "kq-ky"
+    BACKUP_HTML_TIME_CLASS = "kq-time"
+    BACKUP_HTML_BALLS_CLASS = "kq-balls"
+    BACKUP_HTML_BALL_CLASS = "kq-ball"
+    # Số kỳ gần nhất lấy từ nguồn dự phòng khi nguồn chính hoàn toàn không có kỳ mới
+    BACKUP_MERGE_LIMIT = 60
 
 class KenoScraper:
     """
@@ -147,8 +169,12 @@ class KenoScraper:
 
     def parse_keno_rows(self, html_content):
         """
-        Phân tích cú pháp HTML của trang Keno (giao diện thiết kế lại) và trả về danh sách
-        các dòng kết quả đã được định dạng sẵn theo đúng thứ tự xuất hiện trên trang.
+        Phân tích cú pháp HTML trang Keno minhchinh (giao diện thiết kế lại).
+
+        Trả về ParseOutcome:
+            - records    : các kỳ đủ ngày + giờ + 20 số.
+            - incomplete : các kỳ có ngày/giờ nhưng THIẾU số (không đủ 20) để run() thử vá từ
+                           nguồn dự phòng ketquadientoan.
 
         Cấu trúc HTML mới:
             div#containerKQKeno > div.kn-card > div.kn-table > div.kn-row
@@ -157,11 +183,10 @@ class KenoScraper:
             - .kn-time  : giờ quay   (ví dụ "09:44")
             - .kn-date  : ngày quay  (ví dụ "18/09/2026")
             - .kn-balls : vùng chứa 20 span.kn-ball (bộ số kết quả)
-
-        Kết quả trả về: danh sách chuỗi dạng "DD/MM/YYYY,HH:MM,n1,...,n20".
         """
+        outcome = ParseOutcome()
         if not html_content:
-            return []
+            return outcome
 
         soup = BeautifulSoup(html_content, 'html.parser')
 
@@ -172,7 +197,6 @@ class KenoScraper:
         if container is None:
             container = soup
 
-        records = []
         for row in container.find_all('div', class_=KenoConstants.HTML_ROW_CLASS):
             # Bỏ qua dòng tiêu đề của bảng kết quả
             if KenoConstants.HTML_ROW_HEAD_CLASS in (row.get('class') or []):
@@ -198,23 +222,143 @@ class KenoScraper:
                     if ball.get_text(strip=True).isdigit()
                 ]
 
-            # Xác thực dữ liệu: đảm bảo có đầy đủ Ngày, Giờ và đúng 20 số trúng
-            if draw_date and draw_time and len(numbers) == KenoConstants.EXPECTED_NUMBERS_COUNT:
-                # Định dạng dòng dữ liệu theo yêu cầu: Ngày,Giờ,Số1,Số2,...,Số20
-                records.append(f"{draw_date},{draw_time},{','.join(numbers)}")
-            else:
+            # Không có ngày/giờ thì không thể định danh kỳ -> bỏ qua hoàn toàn.
+            if not draw_date or not draw_time:
                 print(
-                    f"Bỏ qua kỳ quay {draw_id} do dữ liệu không hợp lệ "
-                    f"(ngày='{draw_date}', giờ='{draw_time}', số lượng số nhận được={len(numbers)})."
+                    f"Bỏ qua kỳ quay {draw_id} do thiếu ngày/giờ "
+                    f"(ngày='{draw_date}', giờ='{draw_time}')."
+                )
+                continue
+
+            record = f"{draw_date},{draw_time},{','.join(numbers)}"
+            missing_fields = detect_missing_fields(GameId.KENO, record)
+            outcome.add(GameId.KENO, record)
+            if missing_fields:
+                print(
+                    f"⚠️  Kỳ quay {draw_id} thiếu dữ liệu "
+                    f"(nhận được {len(numbers)}/{KenoConstants.EXPECTED_NUMBERS_COUNT} số) "
+                    f"-> sẽ thử vá từ nguồn dự phòng."
                 )
 
-        return records
+        return outcome
+
+    @staticmethod
+    def record_key(record):
+        """Khóa định danh kỳ Keno = DD/MM/YYYY,HH:MM (2 field đầu)."""
+        parts = record.split(",")
+        if len(parts) >= 2:
+            return f"{parts[0]},{parts[1]}"
+        return record
+
+    def fetch_page_content_backup(self):
+        """Tải HTML từ nguồn dự phòng ketquadientoan (dùng lại cơ chế retry)."""
+        session = requests.Session()
+        try:
+            return self.get_request_with_retry(session, KenoConstants.URL_BACKUP)
+        except Exception as e:
+            print(f"⚠️  Không tải được nguồn dự phòng {KenoConstants.BACKUP_SOURCE_LABEL}: {e}")
+            return None
+
+    def parse_keno_backup(self, html_content):
+        """
+        Phân tích HTML nguồn dự phòng ketquadientoan (cấu trúc .kq-*).
+
+        Mỗi kỳ là một <article class="kq-item">:
+            - .kq-ky    : mã kỳ (chỉ để log)
+            - .kq-time  : "21:52 · 13/10/2026" -> giờ + ngày
+            - .kq-balls : 20 span.kq-ball
+
+        Trả về ParseOutcome (records đầy đủ + incomplete nếu thiếu số).
+        """
+        outcome = ParseOutcome()
+        if not html_content:
+            return outcome
+
+        soup = BeautifulSoup(html_content, 'html.parser')
+        for article in soup.find_all('article', class_=KenoConstants.BACKUP_HTML_ITEM_CLASS):
+            time_div = article.find('div', class_=KenoConstants.BACKUP_HTML_TIME_CLASS)
+            if not time_div:
+                continue
+            raw = time_div.get_text(" ", strip=True)
+            time_match = re.search(r'(\d{2}:\d{2})', raw)
+            date_match = re.search(r'(\d{2}/\d{2}/\d{4})', raw)
+            if not time_match or not date_match:
+                continue
+            draw_time = time_match.group(1)
+            draw_date = date_match.group(1)
+
+            balls_div = article.find('div', class_=KenoConstants.BACKUP_HTML_BALLS_CLASS)
+            numbers = []
+            if balls_div:
+                numbers = [
+                    ball.get_text(strip=True)
+                    for ball in balls_div.find_all('span', class_=KenoConstants.BACKUP_HTML_BALL_CLASS)
+                    if ball.get_text(strip=True).isdigit()
+                ]
+
+            record = f"{draw_date},{draw_time},{','.join(numbers)}"
+            outcome.add(GameId.KENO, record)
+
+        return outcome
+
+    def fill_from_backup(self, new_records, incomplete_records, existing_records):
+        """
+        Bù các kỳ thiếu từ nguồn dự phòng (lazy: chỉ gọi khi thực sự thiếu dữ liệu).
+
+        - Với mỗi kỳ thiếu trong incomplete_records: nếu nguồn dự phòng có bản đầy đủ cùng
+          khóa thì dùng bản đó.
+        - Nếu nguồn chính hoàn toàn không có kỳ mới: bổ sung các kỳ gần nhất từ nguồn dự phòng.
+
+        Returns:
+            Danh sách new_records đã được bù.
+        """
+        # Chỉ tải nguồn dự phòng khi thiếu kỳ HOẶC không cào được kỳ mới nào.
+        if new_records and not incomplete_records:
+            return new_records
+
+        print(
+            f"⚠️  Keno thiếu dữ liệu (kỳ mới: {len(new_records)}, kỳ chưa đủ: "
+            f"{len(incomplete_records)}), tải nguồn dự phòng {KenoConstants.BACKUP_SOURCE_LABEL}..."
+        )
+        html = self.fetch_page_content_backup()
+        if not html:
+            return new_records
+
+        backup_outcome = self.parse_keno_backup(html)
+        backup_map = {self.record_key(record): record for record in backup_outcome.records}
+        known_keys = {self.record_key(record) for record in existing_records}
+        known_keys |= {self.record_key(record) for record in new_records}
+
+        added = 0
+        for record in incomplete_records:
+            key = self.record_key(record)
+            backup_record = backup_map.get(key)
+            if backup_record and key not in known_keys:
+                new_records.append(backup_record)
+                known_keys.add(key)
+                added += 1
+                print(f"   ↳ Vá kỳ {key} từ nguồn dự phòng.")
+
+        # Nếu vẫn không có kỳ mới nào: bổ sung các kỳ gần nhất từ nguồn dự phòng.
+        if not new_records:
+            for record in backup_outcome.records[: KenoConstants.BACKUP_MERGE_LIMIT]:
+                key = self.record_key(record)
+                if key not in known_keys:
+                    new_records.append(record)
+                    known_keys.add(key)
+                    added += 1
+
+        print(f"   Vá dự phòng Keno: thêm {added} kỳ từ nguồn dự phòng.")
+        return new_records
 
     def scrape_today(self, existing_records):
         """
         Quét kết quả Keno mới nhất bằng cách giả lập thao tác gửi biểu mẫu tìm kiếm
         cho ngày hôm nay (kết hợp phân trang). Dừng ngay lập tức khi phát hiện
         bản ghi đã có trong file kết quả để đảm bảo cào tăng trưởng.
+
+        Returns:
+            (new_records, incomplete_records)
         """
         today_str = datetime.now().strftime(KenoConstants.DATE_FORMAT_REQUEST)
         print(f"Bắt đầu cào Keno mới nhất hôm nay ({today_str}) từ Minh Chính...")
@@ -223,6 +367,8 @@ class KenoScraper:
         session = requests.Session()
 
         new_records = []
+        incomplete_records = []
+        seen_incomplete = set()
         stop_scraping = False
         # Tập hợp các bản ghi đã biết (dữ liệu cũ + dữ liệu vừa cào) để chống trùng lặp
         seen_records = set(existing_records)
@@ -249,7 +395,9 @@ class KenoScraper:
                 break
 
             # Sử dụng BeautifulSoup để phân tích cú pháp mã nguồn HTML theo giao diện mới
-            page_records = self.parse_keno_rows(html_content)
+            page_outcome = self.parse_keno_rows(html_content)
+            page_records = page_outcome.records
+            self._collect_incomplete(page_outcome.incomplete, incomplete_records, seen_incomplete)
 
             # Phương án dự phòng: nếu POST không trả về dòng nào ở trang đầu tiên
             # (ví dụ máy chủ thay đổi cách xử lý biểu mẫu), thử tải trực tiếp bằng GET.
@@ -257,7 +405,11 @@ class KenoScraper:
                 print("Không nhận được dữ liệu từ biểu mẫu POST, thử tải trực tiếp bằng GET...")
                 try:
                     html_content = self.get_request_with_retry(session, self.base_url)
-                    page_records = self.parse_keno_rows(html_content)
+                    page_outcome = self.parse_keno_rows(html_content)
+                    page_records = page_outcome.records
+                    self._collect_incomplete(
+                        page_outcome.incomplete, incomplete_records, seen_incomplete
+                    )
                 except Exception as e:
                     print(f"Phương án dự phòng GET cũng thất bại: {e}")
 
@@ -280,7 +432,15 @@ class KenoScraper:
 
             print(f"Trang {page}: Thu thập được {page_records_count} kỳ quay mới.")
 
-        return new_records
+        return new_records, incomplete_records
+
+    def _collect_incomplete(self, records, incomplete_records, seen_incomplete):
+        """Gom các kỳ thiếu dữ liệu (loại trùng theo khóa date,time)."""
+        for record in records:
+            key = self.record_key(record)
+            if key not in seen_incomplete:
+                seen_incomplete.add(key)
+                incomplete_records.append(record)
 
     def parse_line_datetime(self, line):
         """
@@ -351,8 +511,13 @@ class KenoScraper:
         else:
             print("Chưa có kết quả cũ hoặc file trống. Tiến hành cào mới hoàn toàn.")
 
-        # 2. Quét dữ liệu kết quả hôm nay
-        all_new_records = self.scrape_today(existing_records)
+        # 2. Quét dữ liệu kết quả hôm nay (nguồn chính minhchinh)
+        all_new_records, incomplete_records = self.scrape_today(existing_records)
+
+        # 2b. Dự phòng theo kỳ: bù kỳ thiếu từ ketquadientoan (chỉ khi thực sự cần).
+        all_new_records = self.fill_from_backup(
+            all_new_records, incomplete_records, existing_records
+        )
 
         # 3. Gộp dữ liệu mới và cũ, loại bỏ trùng lặp và sắp xếp theo thứ tự giảm dần thời gian
         self.save_and_sort_records(all_new_records)
